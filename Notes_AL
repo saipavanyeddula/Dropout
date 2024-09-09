@@ -1,0 +1,13 @@
+thesis topic :object detection with active learning strategies.
+-train the custom dataset with baseline model as yolov5 with dropout layers activated.
+-save the results of the run.
+-use that weights for mc dropout inference with model.test.
+-select the high uncertainity or less confidence predictions top 10 or 20.
+-send those for human to annotate.
+-train the pretained model with added annotated images from human.  
+repeat process.
+
+
+
+need to discuss with joed:
+train with mc dropout applied or without during intial stage 
