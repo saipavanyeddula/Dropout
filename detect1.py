@@ -64,7 +64,7 @@ from utils.general import (
     xyxy2xywh,
 )
 from utils.torch_utils import select_device, smart_inference_mode
-
+import numpy as np
 
 @smart_inference_mode()
 def run(
@@ -97,6 +97,9 @@ def run(
     half=False,  # use FP16 half-precision inference
     dnn=False,  # use OpenCV DNN for ONNX inference
     vid_stride=1,  # video frame-rate stride
+    num_forward_passes=3,  # Number of stochastic passes for uncertainty estimation
+    uncertainty_threshold=0.1,  # Uncertainty threshold for active learning
+    save_uncertain=False,  # Whether to save uncertain predictions
 ):
     """
     Runs YOLOv5 detection inference on various sources like images, videos, directories, streams, etc.
@@ -166,6 +169,8 @@ def run(
     model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data, fp16=half)
     stride, names, pt = model.stride, model.names, model.pt
     imgsz = check_img_size(imgsz, s=stride)  # check image size
+    #model.train()
+    all_preds=[]
 
     # Dataloader
     bs = 1  # batch_size
@@ -191,11 +196,11 @@ def run(
                 im = im[None]  # expand for batch dim
             if model.xml and im.shape[0] > 1:
                 ims = torch.chunk(im, im.shape[0], 0)
-        num_forward_passes=2
-        preds_per_image = []
+
+        all_preds = []
         for _ in range(num_forward_passes):
 
-             # Inference
+            # Inference
             with dt[1]:
                 visualize = increment_path(save_dir / Path(path).stem, mkdir=True) if visualize else False
                 if model.xml and im.shape[0] > 1:
@@ -205,7 +210,8 @@ def run(
                             pred = model(image, augment=augment, visualize=visualize).unsqueeze(0)
                             print(f"print if pred is None")
                         else:
-                            pred = torch.cat((pred, model(image, augment=augment, visualize=visualize).unsqueeze(0)), dim=0)
+                            pred = torch.cat((pred, model(image, augment=augment, visualize=visualize).unsqueeze(0)),
+                                             dim=0)
                             print("if pred is not none")
                     pred = [pred, None]
                 else:
@@ -215,13 +221,101 @@ def run(
             with dt[2]:
                 pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
                 print(f"after nms {pred}")
-                preds.append(pred)
-        print(preds)
-        print(len(preds))
-
-
+                all_preds.append(pred)
+        #print(preds)
+        print("length of all preds",len(all_preds))
         # Second-stage classifier (optional)
         # pred = utils.general.apply_classifier(pred, classifier_model, im, im0s)
+        # Process predictions and calculate uncertainties
+        final_preds = []
+        uncertainty_threshold = 0.7  # Adjust as needed
+
+        # Navigate to the actual tensor inside the nested list
+        for preds in all_preds:
+            preds_array = []
+
+            # Navigate through the nested list structure to extract the actual tensors
+            for p in preds:
+                for inner_tensor_list in p:  # The extra nesting inside each pred
+                    for tensor in inner_tensor_list:
+                        if isinstance(tensor, torch.Tensor):  # Ensure we have a tensor
+                            preds_array.append(tensor.cpu().numpy())  # Convert to NumPy
+            # You can't directly convert this list to a NumPy array if the shapes differ
+            # Process each tensor separately
+            for tensor_data in preds_array:
+                try:
+                    tensor_data = np.array(tensor_data)
+                    print(f"Shape of tensor_data: {tensor_data.shape}")
+                except ValueError as e:
+                    print(f"Skipping tensor due to shape issue: {e}")
+                    continue
+
+                # Process the tensor if the shape is correct
+                if len(tensor_data) > 0:  # Ensure we have valid data
+                    boxes_list = tensor_data[:, :4]  # Extract bounding boxes
+                    print(f"shape of boxes list :  {boxes_list.shape}")
+                    confs_list = tensor_data[:, 4]  # Extract confidence scores
+                    print(f"shape of boxes list :  {confs_list.shape}")
+
+                    # Stack the results across all forward passes
+                    boxes_arr = np.stack(boxes_list, axis=0)
+                    confs_arr = np.stack(confs_list, axis=0)
+                    print(f"Shape of confs_arr before averaging: {confs_arr.shape}")
+
+                    # Ensure that confs_arr has multiple dimensions (i.e., [num_passes, num_detections])
+                    if len(confs_arr.shape) == 1:
+                        # Expand the dimension if necessary to avoid scalar collapse
+                        confs_arr = np.expand_dims(confs_arr, axis=0)
+                        print(f"Adjusted shape of confs_arr: {confs_arr.shape}")
+
+                    # Compute the mean confidence per detection across passes
+                    mean_confs = np.mean(confs_arr,
+                                         axis=0)  # This should now return an array of shape (num_detections,)
+                    print(f"Shape of mean_confs after averaging: {mean_confs.shape}")
+
+                    # Calculate mean and variance for bounding boxes and confidence scores
+                    mean_boxes = np.mean(boxes_arr, axis=0)
+                    box_variance = np.var(boxes_arr, axis=0)
+                    mean_confs = np.mean(confs_arr, axis=0)
+
+                    print(f"mean_boxes shape: {mean_boxes.shape}")
+                    print(f"mean_confs shape: {mean_confs.shape}")
+                    print(f"box_variance shape: {box_variance.shape}")
+
+                    high_uncertainty_preds = []
+                    for j in range(len(mean_boxes)):
+                        # If variance exceeds threshold, store the prediction
+                        if np.mean(box_variance[j]) > uncertainty_threshold:
+                            high_uncertainty_preds.append((mean_boxes[j], mean_confs[j], box_variance[j]))
+
+                    final_preds.append(high_uncertainty_preds)
+            # Convert list to NumPy array for further processing
+            preds_array = np.array(preds_array)
+            print(f"Shape of preds_array: {preds_array.shape}")
+
+        # Now, process the `preds_array` for bounding boxes and confidence scores
+        for i in range(preds_array.shape[1]):  # Loop over the predictions for each detection
+            # Extract bounding boxes (first 4 elements) and confidence scores (5th element)
+            boxes_list = preds_array[:, i, :4]  # Shape: [num_passes, 4]
+            confs_list = preds_array[:, i, 4]  # Shape: [num_passes]
+
+            # Stack the results across all forward passes
+            boxes_arr = np.stack(boxes_list, axis=0)
+            confs_arr = np.stack(confs_list, axis=0)
+
+            # Calculate mean and variance for bounding boxes and confidence scores
+            mean_boxes = np.mean(boxes_arr, axis=0)
+            box_variance = np.var(boxes_arr, axis=0)
+            mean_confs = np.mean(confs_arr, axis=0)
+
+            high_uncertainty_preds = []
+            for j in range(len(mean_boxes)):
+                # If variance exceeds threshold, store the prediction
+                if np.mean(box_variance[j]) > uncertainty_threshold:
+                    high_uncertainty_preds.append((mean_boxes[j], mean_confs[j], box_variance[j]))
+
+            # Append high-uncertainty predictions
+            final_preds.append(high_uncertainty_preds)
 
         # Define the path for the CSV file
         csv_path = save_dir / "predictions.csv"
@@ -237,7 +331,7 @@ def run(
                 writer.writerow(data)
 
         # Process predictions
-        for i, det in enumerate(pred):  # per image
+        for i, det in enumerate(preds):  # per image
             seen += 1
             if webcam:  # batch_size >= 1
                 p, im0, frame = path[i], im0s[i].copy(), dataset.count
